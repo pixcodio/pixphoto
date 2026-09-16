@@ -54,19 +54,22 @@ export function cleanupStaleParticipants(roomId: string) {
   if (!room) return;
 
   const now = Date.now();
-  const timeoutMs = 40000; // 40 seconds timeout for inactive peers
+  const timeoutMs = 18000; // 18 seconds timeout for inactive peers
   let changed = false;
 
   for (const [peerId, participant] of Object.entries(room.participants)) {
     if (now - participant.lastPing > timeoutMs) {
       delete room.participants[peerId];
+      if (room.capturedPhotos[peerId]) {
+        delete room.capturedPhotos[peerId];
+      }
       changed = true;
       broadcastEvent(roomId, {
         id: `evt-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
         type: 'peer-left',
         senderId: peerId,
         timestamp: now,
-        payload: { peerId, reason: 'timeout' },
+        payload: { peerId, reason: 'timeout', roomParticipants: room.participants },
       });
     }
   }
@@ -100,7 +103,17 @@ export function joinRoom(
   // Check if peer is already in room
   if (room.participants[peerId]) {
     room.participants[peerId].lastPing = Date.now();
-    room.participants[peerId].name = name || room.participants[peerId].name;
+    if (name) room.participants[peerId].name = name;
+
+    // Broadcast to other peers so they can re-establish WebRTC connection
+    broadcastEvent(cleanId, {
+      id: `evt-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
+      type: 'peer-joined',
+      senderId: peerId,
+      timestamp: Date.now(),
+      payload: { participant: room.participants[peerId], roomParticipants: room.participants },
+    });
+
     return { success: true, room };
   }
 
@@ -143,12 +156,15 @@ export function leaveRoom(roomId: string, peerId: string) {
 
   if (room.participants[peerId]) {
     delete room.participants[peerId];
+    if (room.capturedPhotos[peerId]) {
+      delete room.capturedPhotos[peerId];
+    }
     broadcastEvent(cleanId, {
       id: `evt-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
       type: 'peer-left',
       senderId: peerId,
       timestamp: Date.now(),
-      payload: { peerId },
+      payload: { peerId, roomParticipants: room.participants },
     });
   }
 }

@@ -121,6 +121,7 @@ function BoothSession({ roomId, userName }: { roomId: string; userName: string }
     isAudioMuted,
     toggleAudio,
     toggleCameraFacing,
+    exitRoom,
   } = useRoomWebRTC({ roomId, userName });
 
   // Handle Full Room (Max 4 people)
@@ -197,6 +198,7 @@ function BoothSession({ roomId, userName }: { roomId: string; userName: string }
         isAudioMuted={isAudioMuted}
         onToggleAudio={toggleAudio}
         onToggleCameraFacing={toggleCameraFacing}
+        onExitRoom={exitRoom}
       />
 
       {/* Main Studio Workspace */}

@@ -17,7 +17,18 @@ interface UseRoomWebRTCOptions {
 }
 
 export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
-  const [peerId] = useState(() => `peer_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`);
+  const [peerId] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const storageKey = `pixphoto_peer_${roomId}`;
+      let stored = sessionStorage.getItem(storageKey);
+      if (!stored) {
+        stored = `peer_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+        sessionStorage.setItem(storageKey, stored);
+      }
+      return stored;
+    }
+    return `peer_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  });
   const [localStream, setLocalStream] = useState<MediaStream | null>(null);
   const [remoteStreams, setRemoteStreams] = useState<Record<string, MediaStream>>({});
   const [participants, setParticipants] = useState<Record<string, Participant>>({});
@@ -218,18 +229,30 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
             setParticipants((prev) => ({ ...prev, [newPeerId]: payload.participant! }));
           }
 
-          // Existing peer creates offer to newly arrived peer
+          // If an old connection exists for this peerId (e.g. from before a refresh), close it
+          const oldPc = peerConnections.current.get(newPeerId);
+          if (oldPc) {
+            oldPc.close();
+            peerConnections.current.delete(newPeerId);
+          }
+
+          // Existing peer creates offer to newly arrived / refreshed peer
           initiateOffer(newPeerId);
           break;
         }
 
         case 'peer-left': {
           const leftPeerId = event.senderId;
-          setParticipants((prev) => {
-            const next = { ...prev };
-            delete next[leftPeerId];
-            return next;
-          });
+          const payload = event.payload as { roomParticipants?: Record<string, Participant> } | undefined;
+          if (payload?.roomParticipants) {
+            setParticipants(payload.roomParticipants);
+          } else {
+            setParticipants((prev) => {
+              const next = { ...prev };
+              delete next[leftPeerId];
+              return next;
+            });
+          }
           setRemoteStreams((prev) => {
             const next = { ...prev };
             delete next[leftPeerId];
@@ -357,6 +380,18 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
     setCountdown(null);
     sendSignal('reset-booth');
   }, [sendSignal]);
+
+  // Leave room explicitly
+  const exitRoom = useCallback(() => {
+    if (typeof window !== 'undefined') {
+      sessionStorage.removeItem(`pixphoto_peer_${roomId}`);
+    }
+    fetch(`/api/rooms/${roomId}/leave`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ peerId }),
+    }).catch(() => {});
+  }, [roomId, peerId]);
 
   // Initialize Camera
   const startCamera = useCallback(async (facing: 'user' | 'environment') => {
@@ -586,6 +621,7 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
     hasCapturedPhotos: Object.keys(capturedPhotos).length > 0,
     startPhotoSession,
     resetSession,
+    exitRoom,
     // Device controls
     isMirrored,
     toggleMirror,

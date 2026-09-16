@@ -6,6 +6,7 @@ import {
   setRoomFilter,
   resetBooth,
   updatePing,
+  leaveRoom,
 } from '@/lib/room-store';
 import { SignalEvent } from '@/lib/types';
 
@@ -33,6 +34,12 @@ export async function POST(
         { error: 'type dan senderId diperlukan' },
         { status: 400 }
       );
+    }
+
+    // Handle peer-left directly
+    if (type === 'peer-left') {
+      leaveRoom(cleanId, senderId);
+      return NextResponse.json({ success: true });
     }
 
     updatePing(cleanId, senderId);
