@@ -1,8 +1,7 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { FilterType, Participant, TemplateType } from '@/lib/types';
-import { Sparkles, User } from 'lucide-react';
 
 interface MagazineLiveFeedProps {
   template: TemplateType;
@@ -25,6 +24,67 @@ const FILTER_CSS: Record<FilterType, string> = {
   grain: 'contrast(115%) brightness(95%) saturate(90%)',
 };
 
+// Component to reliably render and play a remote peer's camera stream without black frames
+function RemoteVideo({
+  stream,
+  filter,
+  name,
+}: {
+  stream?: MediaStream | null;
+  filter: FilterType;
+  name: string;
+}) {
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+
+  useEffect(() => {
+    const el = videoRef.current;
+    if (!el) return;
+
+    if (stream) {
+      if (el.srcObject !== stream) {
+        el.srcObject = stream;
+      }
+      // Attempt unmuted play, fallback to muted if browser autoplay policy blocks unmuted audio
+      const playPromise = el.play();
+      if (playPromise !== undefined) {
+        playPromise.catch((err) => {
+          console.warn('Autoplay unmuted blocked, falling back to muted playback:', err);
+          el.muted = true;
+          el.play().catch((e) => console.error('Play muted error:', e));
+        });
+      }
+    } else {
+      el.srcObject = null;
+    }
+  }, [stream]);
+
+  return (
+    <div className="relative w-full h-full">
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        data-remote="true"
+        onPlaying={() => setIsPlaying(true)}
+        onPause={() => setIsPlaying(false)}
+        onWaiting={() => setIsPlaying(false)}
+        style={{ filter: FILTER_CSS[filter] }}
+        className={`w-full h-full object-cover transition-opacity duration-300 ${
+          isPlaying && stream ? 'opacity-100' : 'opacity-0'
+        }`}
+      />
+      {(!isPlaying || !stream) && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center bg-zinc-950/90 text-zinc-400 p-4 text-center z-0">
+          <div className="w-7 h-7 rounded-full border-2 border-amber-400/60 border-t-transparent animate-spin mb-2" />
+          <p className="text-xs font-sans font-medium text-zinc-200">{name}</p>
+          <p className="text-[10px] text-zinc-500 font-mono mt-0.5">Menghubungkan kamera...</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function MagazineLiveFeed({
   template,
   filter,
@@ -36,33 +96,44 @@ export default function MagazineLiveFeed({
   localVideoRef,
   roomCode,
 }: MagazineLiveFeedProps) {
-  // Setup remote video refs
-  const remoteVideoRefs = useRef<Record<string, HTMLVideoElement | null>>({});
-
   // Attach local stream
   useEffect(() => {
     if (localVideoRef.current && localStream) {
       localVideoRef.current.srcObject = localStream;
+      localVideoRef.current.play().catch(() => {});
     }
   }, [localStream, localVideoRef]);
 
-  // Attach remote streams
+  // Global user interaction handler to unmute any remote videos that were muted due to browser policy
   useEffect(() => {
-    Object.entries(remoteStreams).forEach(([pId, stream]) => {
-      const el = remoteVideoRefs.current[pId];
-      if (el && el.srcObject !== stream) {
-        el.srcObject = stream;
-      }
-    });
-  }, [remoteStreams]);
+    const handleUserInteraction = () => {
+      const videos = document.querySelectorAll<HTMLVideoElement>('video[data-remote="true"]');
+      videos.forEach((v) => {
+        if (v.muted) {
+          v.muted = false;
+          v.play().catch(() => {
+            v.muted = true;
+          });
+        }
+      });
+    };
 
-  const remotePeerIds = Object.keys(remoteStreams);
-  const totalPeers = 1 + remotePeerIds.length;
+    window.addEventListener('click', handleUserInteraction, { once: true });
+    window.addEventListener('touchstart', handleUserInteraction, { once: true });
+    return () => {
+      window.removeEventListener('click', handleUserInteraction);
+      window.removeEventListener('touchstart', handleUserInteraction);
+    };
+  }, []);
+
+  // Use actual participants list to ensure friends' panels are always present as soon as they join
+  const remoteParticipants = Object.values(participants).filter((p) => p.id !== peerId);
+  const totalPeers = 1 + remoteParticipants.length;
 
   const myName = participants[peerId]?.name || 'You';
   const allNames = [
     myName,
-    ...remotePeerIds.map((id) => participants[id]?.name || 'Guest'),
+    ...remoteParticipants.map((p) => p.name || 'Friend'),
   ];
 
   return (
@@ -120,52 +191,36 @@ export default function MagazineLiveFeed({
                   }}
                   className="w-full h-full object-cover"
                 />
-                <div className="absolute bottom-2 left-2 bg-black/60 backdrop-blur-md px-2 py-0.5 rounded text-[10px] font-sans text-white tracking-wider flex items-center gap-1">
+                <div className="absolute bottom-2 left-2 bg-black/60 backdrop-blur-md px-2 py-0.5 rounded text-[10px] font-sans text-white tracking-wider flex items-center gap-1 z-10">
                   <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
                   {myName} (You)
                 </div>
               </div>
 
               {/* Remote Participants Videos */}
-              {remotePeerIds.map((rId) => {
-                const pName = participants[rId]?.name || 'Friend';
+              {remoteParticipants.map((p) => {
+                const stream = remoteStreams[p.id];
                 return (
                   <div
-                    key={rId}
+                    key={p.id}
                     className="relative overflow-hidden bg-zinc-950 rounded-xs border border-zinc-200/40"
                   >
-                    <video
-                      ref={(el) => {
-                        remoteVideoRefs.current[rId] = el;
-                      }}
-                      autoPlay
-                      playsInline
-                      style={{ filter: FILTER_CSS[filter] }}
-                      className="w-full h-full object-cover"
+                    <RemoteVideo
+                      stream={stream}
+                      filter={filter}
+                      name={p.name || 'Friend'}
                     />
-                    <div className="absolute bottom-2 left-2 bg-black/60 backdrop-blur-md px-2 py-0.5 rounded text-[10px] font-sans text-white tracking-wider flex items-center gap-1">
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                      {pName}
+                    <div className="absolute bottom-2 left-2 bg-black/60 backdrop-blur-md px-2 py-0.5 rounded text-[10px] font-sans text-white tracking-wider flex items-center gap-1 z-10">
+                      <span
+                        className={`w-1.5 h-1.5 rounded-full ${
+                          stream ? 'bg-emerald-400' : 'bg-amber-400 animate-pulse'
+                        }`}
+                      />
+                      {p.name || 'Friend'}
                     </div>
                   </div>
                 );
               })}
-
-              {/* Waiting Slots Placeholders if less than 4 */}
-              {Array.from({ length: Math.max(0, (totalPeers === 1 ? 0 : 4 - totalPeers)) }).map((_, idx) => (
-                <div
-                  key={`empty-${idx}`}
-                  className="relative overflow-hidden bg-zinc-100 border border-dashed border-zinc-300 rounded-xs flex flex-col items-center justify-center text-zinc-400 p-4 text-center"
-                >
-                  <User className="w-6 h-6 mb-1 opacity-40" />
-                  <span className="text-[10px] font-sans font-medium tracking-wider uppercase text-zinc-500">
-                    Menunggu Teman #{totalPeers + idx + 1}
-                  </span>
-                  <span className="text-[9px] font-mono text-zinc-400 mt-0.5">
-                    Maks. 4 orang di room
-                  </span>
-                </div>
-              ))}
             </div>
 
             {/* Grain Overlay if selected */}
@@ -267,58 +322,42 @@ export default function MagazineLiveFeed({
                   }}
                   className="w-full h-full object-cover"
                 />
-                <div className="absolute top-2 left-2 bg-[#ffe600] text-black px-1.5 py-0.2 font-mono text-[9px] font-bold uppercase">
+                <div className="absolute top-2 left-2 bg-[#ffe600] text-black px-1.5 py-0.2 font-mono text-[9px] font-bold uppercase z-10">
                   FRAME #01
                 </div>
-                <div className="absolute bottom-2 left-2 bg-black/70 backdrop-blur-md px-2 py-0.5 rounded text-[10px] font-mono text-white tracking-wider flex items-center gap-1">
+                <div className="absolute bottom-2 left-2 bg-black/70 backdrop-blur-md px-2 py-0.5 rounded text-[10px] font-mono text-white tracking-wider flex items-center gap-1 z-10">
                   <span className="w-1.5 h-1.5 rounded-full bg-yellow-400 animate-pulse" />
                   {myName} (You)
                 </div>
               </div>
 
               {/* Remote Participants Videos */}
-              {remotePeerIds.map((rId, idx) => {
-                const pName = participants[rId]?.name || 'Friend';
+              {remoteParticipants.map((p, idx) => {
+                const stream = remoteStreams[p.id];
                 return (
                   <div
-                    key={rId}
+                    key={p.id}
                     className="relative overflow-hidden bg-zinc-950 rounded-xs border border-zinc-700/60"
                   >
-                    <video
-                      ref={(el) => {
-                        remoteVideoRefs.current[rId] = el;
-                      }}
-                      autoPlay
-                      playsInline
-                      style={{ filter: FILTER_CSS[filter] }}
-                      className="w-full h-full object-cover"
+                    <RemoteVideo
+                      stream={stream}
+                      filter={filter}
+                      name={p.name || 'Friend'}
                     />
-                    <div className="absolute top-2 left-2 bg-zinc-800 text-zinc-300 px-1.5 py-0.2 font-mono text-[9px] font-bold uppercase">
+                    <div className="absolute top-2 left-2 bg-zinc-800 text-zinc-300 px-1.5 py-0.2 font-mono text-[9px] font-bold uppercase z-10">
                       FRAME #0{idx + 2}
                     </div>
-                    <div className="absolute bottom-2 left-2 bg-black/70 backdrop-blur-md px-2 py-0.5 rounded text-[10px] font-mono text-white tracking-wider flex items-center gap-1">
-                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                      {pName}
+                    <div className="absolute bottom-2 left-2 bg-black/70 backdrop-blur-md px-2 py-0.5 rounded text-[10px] font-mono text-white tracking-wider flex items-center gap-1 z-10">
+                      <span
+                        className={`w-1.5 h-1.5 rounded-full ${
+                          stream ? 'bg-emerald-400' : 'bg-yellow-400 animate-pulse'
+                        }`}
+                      />
+                      {p.name || 'Friend'}
                     </div>
                   </div>
                 );
               })}
-
-              {/* Waiting Slots Placeholders */}
-              {Array.from({ length: Math.max(0, (totalPeers === 1 ? 0 : 4 - totalPeers)) }).map((_, idx) => (
-                <div
-                  key={`empty-${idx}`}
-                  className="relative overflow-hidden bg-zinc-900/60 border border-dashed border-zinc-700 rounded-xs flex flex-col items-center justify-center text-zinc-500 p-4 text-center"
-                >
-                  <Sparkles className="w-5 h-5 mb-1 text-zinc-600" />
-                  <span className="text-[10px] font-mono font-semibold tracking-wider uppercase text-zinc-400">
-                    SLOT TEMAN #{totalPeers + idx + 1}
-                  </span>
-                  <span className="text-[9px] font-mono text-zinc-600 mt-0.5">
-                    Maksimal 4 orang
-                  </span>
-                </div>
-              ))}
             </div>
 
             {/* Grain Overlay */}

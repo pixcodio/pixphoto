@@ -8,7 +8,19 @@ const RTC_CONFIG: RTCConfiguration = {
   iceServers: [
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
+    { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:openrelay.metered.ca:80' },
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ],
+  iceCandidatePoolSize: 10,
 };
 
 interface UseRoomWebRTCOptions {
@@ -44,16 +56,29 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
   const [capturedPhotos, setCapturedPhotos] = useState<Record<string, string>>({});
   const [isCapturing, setIsCapturing] = useState(false);
   const [isMirrored, setIsMirrored] = useState(true);
-  const [isAudioMuted, setIsAudioMuted] = useState(false);
+  const [isAudioMuted, setIsAudioMuted] = useState(true);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
 
   const peerConnections = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const iceCandidatesQueue = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const localVideoRef = useRef<HTMLVideoElement | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const sseRef = useRef<EventSource | null>(null);
   const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastEventTimeRef = useRef<number>(0);
   const isHostRef = useRef<boolean>(false);
+  const isMirroredRef = useRef<boolean>(isMirrored);
+  useEffect(() => {
+    isMirroredRef.current = isMirrored;
+  }, [isMirrored]);
+
+  const isAudioMutedRef = useRef<boolean>(true);
+  useEffect(() => {
+    isAudioMutedRef.current = isAudioMuted;
+  }, [isAudioMuted]);
+
+  // Forward ref for initiateOffer to resolve circular dependency with createPeerConnection
+  const initiateOfferRef = useRef<(remotePeerId: string, iceRestart?: boolean) => Promise<void>>(async () => {});
 
   // Helper to send signals to API
   const sendSignal = useCallback(
@@ -87,7 +112,7 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
     const ctx = canvas.getContext('2d');
     if (!ctx) return null;
 
-    if (isMirrored) {
+    if (isMirroredRef.current) {
       ctx.translate(canvas.width, 0);
       ctx.scale(-1, 1);
     }
@@ -95,7 +120,7 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
     const dataUrl = canvas.toDataURL('image/jpeg', 0.95);
     return dataUrl;
-  }, [isMirrored]);
+  }, []);
 
   // Execute synchronized countdown
   const triggerLocalCountdown = useCallback(
@@ -150,11 +175,27 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
     [captureLocalSnapshot, peerId, roomId]
   );
 
+  // Helper to flush queued ICE candidates once remoteDescription is set
+  const flushQueuedIceCandidates = useCallback(async (remotePeerId: string, pc: RTCPeerConnection) => {
+    const queue = iceCandidatesQueue.current.get(remotePeerId);
+    if (queue && queue.length > 0) {
+      for (const candidate of queue) {
+        try {
+          await pc.addIceCandidate(new RTCIceCandidate(candidate));
+        } catch (err) {
+          console.error('Error adding queued ICE candidate for peer:', remotePeerId, err);
+        }
+      }
+      iceCandidatesQueue.current.delete(remotePeerId);
+    }
+  }, []);
+
   // Setup PeerConnection for a specific remote peer
   const createPeerConnection = useCallback(
     (remotePeerId: string) => {
-      if (peerConnections.current.has(remotePeerId)) {
-        return peerConnections.current.get(remotePeerId)!;
+      const existing = peerConnections.current.get(remotePeerId);
+      if (existing && existing.signalingState !== 'closed') {
+        return existing;
       }
 
       const pc = new RTCPeerConnection(RTC_CONFIG);
@@ -174,18 +215,29 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
         }
       };
 
-      // Handle incoming remote stream
+      // Handle incoming remote stream (support fallback if streams[0] is absent)
       pc.ontrack = (event) => {
-        if (event.streams && event.streams[0]) {
-          setRemoteStreams((prev) => ({
-            ...prev,
-            [remotePeerId]: event.streams[0],
-          }));
+        let stream = event.streams && event.streams[0];
+        if (!stream) {
+          stream = new MediaStream([event.track]);
         }
+        setRemoteStreams((prev) => {
+          const existingStream = prev[remotePeerId];
+          if (existingStream) {
+            if (!existingStream.getTracks().some((t) => t.id === event.track.id)) {
+              existingStream.addTrack(event.track);
+            }
+            return { ...prev, [remotePeerId]: existingStream };
+          }
+          return { ...prev, [remotePeerId]: stream };
+        });
       };
 
       pc.onconnectionstatechange = () => {
-        if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
+        if (pc.connectionState === 'failed') {
+          console.warn(`[WebRTC] Peer ${remotePeerId} connection failed, attempting ICE restart...`);
+          initiateOfferRef.current(remotePeerId, true);
+        } else if (pc.connectionState === 'closed') {
           setRemoteStreams((prev) => {
             const next = { ...prev };
             delete next[remotePeerId];
@@ -201,18 +253,21 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
 
   // Initiate WebRTC offer to another peer
   const initiateOffer = useCallback(
-    async (remotePeerId: string) => {
+    async (remotePeerId: string, iceRestart = false) => {
       try {
         const pc = createPeerConnection(remotePeerId);
-        const offer = await pc.createOffer();
+        const offer = await pc.createOffer(iceRestart ? { iceRestart: true } : undefined);
         await pc.setLocalDescription(offer);
         await sendSignal('webrtc-offer', { sdp: offer }, remotePeerId);
       } catch (err) {
-        console.error('Error creating offer:', err);
+        console.error('Error creating offer for peer:', remotePeerId, err);
       }
     },
     [createPeerConnection, sendSignal]
   );
+  useEffect(() => {
+    initiateOfferRef.current = initiateOffer;
+  }, [initiateOffer]);
 
   // Handle incoming signals
   const handleSignalEvent = useCallback(
@@ -222,16 +277,20 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
       switch (event.type) {
         case 'peer-joined': {
           const newPeerId = event.senderId;
-          const payload = event.payload as { participant?: Participant; roomParticipants?: Record<string, Participant> } | undefined;
+          const payload = event.payload as {
+            participant?: Participant;
+            roomParticipants?: Record<string, Participant>;
+          } | undefined;
+
           if (payload?.roomParticipants) {
             setParticipants(payload.roomParticipants);
           } else if (payload?.participant) {
             setParticipants((prev) => ({ ...prev, [newPeerId]: payload.participant! }));
           }
 
-          // If an old connection exists for this peerId (e.g. from before a refresh), close it
+          // If an old closed/failed connection exists for this peerId, recreate it
           const oldPc = peerConnections.current.get(newPeerId);
-          if (oldPc) {
+          if (oldPc && (oldPc.signalingState === 'closed' || oldPc.connectionState === 'failed')) {
             oldPc.close();
             peerConnections.current.delete(newPeerId);
           }
@@ -263,14 +322,34 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
             pc.close();
             peerConnections.current.delete(leftPeerId);
           }
+          iceCandidatesQueue.current.delete(leftPeerId);
           break;
         }
 
         case 'webrtc-offer': {
           try {
             const payload = event.payload as { sdp: RTCSessionDescriptionInit };
+            if (!payload?.sdp) return;
+
             const pc = createPeerConnection(event.senderId);
-            await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+
+            // Handle signaling collision (glare)
+            if (pc.signalingState !== 'stable') {
+              try {
+                await Promise.all([
+                  pc.setLocalDescription({ type: 'rollback' }),
+                  pc.setRemoteDescription(new RTCSessionDescription(payload.sdp)),
+                ]);
+              } catch {
+                await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+              }
+            } else {
+              await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+            }
+
+            // Flush queued ICE candidates now that remote description is set
+            await flushQueuedIceCandidates(event.senderId, pc);
+
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
             await sendSignal('webrtc-answer', { sdp: answer }, event.senderId);
@@ -283,9 +362,13 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
         case 'webrtc-answer': {
           try {
             const payload = event.payload as { sdp: RTCSessionDescriptionInit };
+            if (!payload?.sdp) return;
+
             const pc = peerConnections.current.get(event.senderId);
-            if (pc) {
+            if (pc && pc.signalingState === 'have-local-offer') {
               await pc.setRemoteDescription(new RTCSessionDescription(payload.sdp));
+              // Flush queued ICE candidates now that remote description is set
+              await flushQueuedIceCandidates(event.senderId, pc);
             }
           } catch (err) {
             console.error('Error handling answer:', err);
@@ -296,9 +379,18 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
         case 'webrtc-ice': {
           try {
             const payload = event.payload as { candidate: RTCIceCandidateInit };
-            const pc = peerConnections.current.get(event.senderId);
-            if (pc && payload.candidate) {
+            if (!payload?.candidate) return;
+
+            const remoteId = event.senderId;
+            const pc = peerConnections.current.get(remoteId);
+
+            if (pc && pc.remoteDescription && pc.remoteDescription.type) {
               await pc.addIceCandidate(new RTCIceCandidate(payload.candidate));
+            } else {
+              // Queue candidate until remote description is ready
+              const queue = iceCandidatesQueue.current.get(remoteId) || [];
+              queue.push(payload.candidate);
+              iceCandidatesQueue.current.set(remoteId, queue);
             }
           } catch (err) {
             console.error('Error handling ICE candidate:', err);
@@ -347,8 +439,14 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
         }
       }
     },
-    [peerId, createPeerConnection, initiateOffer, sendSignal, triggerLocalCountdown]
+    [peerId, createPeerConnection, flushQueuedIceCandidates, initiateOffer, sendSignal, triggerLocalCountdown]
   );
+
+  // Signal handler ref to prevent effect recreation
+  const handleSignalEventRef = useRef(handleSignalEvent);
+  useEffect(() => {
+    handleSignalEventRef.current = handleSignalEvent;
+  }, [handleSignalEvent]);
 
   // Broadcast start countdown to everyone
   const startPhotoSession = useCallback(() => {
@@ -422,10 +520,15 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
         });
       }
 
+      // Ensure initial audio tracks follow isAudioMutedRef (starts muted by default)
+      stream.getAudioTracks().forEach((track) => {
+        track.enabled = !isAudioMutedRef.current;
+      });
+
       localStreamRef.current = stream;
       setLocalStream(stream);
 
-      // Attach to any existing peer connections
+      // Attach or replace tracks on any existing peer connections
       peerConnections.current.forEach((pc) => {
         const senders = pc.getSenders();
         stream.getTracks().forEach((track) => {
@@ -460,10 +563,15 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
   const toggleAudio = useCallback(() => {
     if (localStreamRef.current) {
       const audioTracks = localStreamRef.current.getAudioTracks();
-      audioTracks.forEach((t) => {
-        t.enabled = !t.enabled;
-      });
-      setIsAudioMuted(!audioTracks[0]?.enabled);
+      if (audioTracks.length > 0) {
+        const nextEnabled = !audioTracks[0].enabled;
+        audioTracks.forEach((t) => {
+          t.enabled = nextEnabled;
+        });
+        setIsAudioMuted(!nextEnabled);
+      } else {
+        setIsAudioMuted((prev) => !prev);
+      }
     }
   }, []);
 
@@ -471,6 +579,7 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
   useEffect(() => {
     let isMounted = true;
     const pcs = peerConnections.current;
+    const iceQueue = iceCandidatesQueue.current;
 
     async function initRoom() {
       setIsLoading(true);
@@ -494,10 +603,28 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
       }
 
       // 2. Start Camera
-      const stream = await startCamera(facingMode);
+      const stream = await startCamera('user');
       if (!stream && !isMounted) return;
 
-      // 3. Join Room API
+      // 3. Connect to SSE BEFORE /join so no events (offers/answers) are missed
+      const sse = new EventSource(`/api/rooms/${roomId}/events?peerId=${peerId}`);
+      sseRef.current = sse;
+
+      sse.addEventListener('message', async (e) => {
+        try {
+          const event: SignalEvent = JSON.parse(e.data);
+          lastEventTimeRef.current = Math.max(lastEventTimeRef.current, event.timestamp);
+          await handleSignalEventRef.current(event);
+        } catch (err) {
+          console.error('SSE JSON error:', err);
+        }
+      });
+
+      sse.onerror = () => {
+        // SSE error; fallback polling will take care of signals
+      };
+
+      // 4. Join Room API
       try {
         const joinRes = await fetch(`/api/rooms/${roomId}/join`, {
           method: 'POST',
@@ -525,23 +652,17 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
           isHostRef.current = true;
         }
 
-        // 4. Connect to SSE
-        const sse = new EventSource(`/api/rooms/${roomId}/events?peerId=${peerId}`);
-        sseRef.current = sse;
-
-        sse.addEventListener('message', (e) => {
-          try {
-            const event: SignalEvent = JSON.parse(e.data);
-            lastEventTimeRef.current = event.timestamp;
-            handleSignalEvent(event);
-          } catch (err) {
-            console.error('SSE JSON error:', err);
+        // If existing participants are already in the room, ensure connection is negotiated
+        Object.keys(room.participants).forEach((otherPeerId) => {
+          if (otherPeerId !== peerId) {
+            setTimeout(() => {
+              const pc = peerConnections.current.get(otherPeerId);
+              if (!pc || pc.connectionState === 'new' || pc.connectionState === 'failed') {
+                initiateOffer(otherPeerId);
+              }
+            }, 1200);
           }
         });
-
-        sse.onerror = () => {
-          // SSE error; fallback polling will take care of signals
-        };
 
         // 5. Setup polling fallback
         pollIntervalRef.current = setInterval(async () => {
@@ -552,17 +673,27 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
             if (pollRes.ok) {
               const pollData = await pollRes.json();
               if (pollData.events && Array.isArray(pollData.events)) {
+                // Await sequentially to preserve signal order (offer -> ice)
                 for (const ev of pollData.events) {
                   lastEventTimeRef.current = Math.max(lastEventTimeRef.current, ev.timestamp);
-                  handleSignalEvent(ev);
+                  await handleSignalEventRef.current(ev);
                 }
               }
               if (pollData.room?.participants) {
                 setParticipants(pollData.room.participants);
+                // Proactively connect to any participant missing an active connection
+                Object.keys(pollData.room.participants).forEach((pId) => {
+                  if (pId !== peerId) {
+                    const pc = peerConnections.current.get(pId);
+                    if (!pc || pc.connectionState === 'failed') {
+                      initiateOffer(pId);
+                    }
+                  }
+                });
               }
             }
           } catch {}
-        }, 3000);
+        }, 2500);
 
         setIsLoading(false);
       } catch (err: unknown) {
@@ -586,6 +717,7 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
       }
       pcs.forEach((pc) => pc.close());
       pcs.clear();
+      iceQueue.clear();
 
       // Notify departure
       fetch(`/api/rooms/${roomId}/signal`, {
@@ -597,7 +729,7 @@ export function useRoomWebRTC({ roomId, userName }: UseRoomWebRTCOptions) {
         }),
       }).catch(() => {});
     };
-  }, [roomId, userName, peerId, facingMode, handleSignalEvent, startCamera]);
+  }, [roomId, userName, peerId, startCamera, initiateOffer]);
 
   return {
     peerId,
