@@ -23,6 +23,7 @@ interface RoomHeaderProps {
   isAudioMuted: boolean;
   onToggleAudio: () => void;
   onToggleCameraFacing: () => void;
+  onExitRoom?: () => void;
 }
 
 export default function RoomHeader({
@@ -34,6 +35,7 @@ export default function RoomHeader({
   isAudioMuted,
   onToggleAudio,
   onToggleCameraFacing,
+  onExitRoom,
 }: RoomHeaderProps) {
   const [copied, setCopied] = useState(false);
 
@@ -134,7 +136,8 @@ export default function RoomHeader({
 
             <Link
               href="/"
-              className="p-1.5 rounded-full text-zinc-500 hover:text-red-400 transition-colors ml-0.5"
+              onClick={onExitRoom}
+              className="p-1.5 rounded-full text-zinc-500 hover:text-red-400 transition-colors ml-0.5 cursor-pointer"
               title="Keluar Room"
             >
               <LogOut className="w-4 h-4" />
